@@ -159,6 +159,28 @@ mod tests {
     use super::super::{ChatFormatterOptions, select_chat_formatter};
     use super::{ChatFormatter, load_chat_formatter};
 
+    /// A DeepSeek-V4.1 developer turn, which SGLang's encoder declines,
+    /// renders through Dynamo's encoder instead.
+    #[test]
+    fn declined_deepseek_v41_requests_render_through_dynamo() {
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "developer", "content": "Be brief."},
+                {"role": "user", "content": "Hi"}
+            ]
+        }))
+        .unwrap();
+        let prompt = ChatFormatter::DeepSeekV41
+            .render_prompt(&request)
+            .unwrap()
+            .into_text();
+        assert!(
+            prompt.contains("Be brief.") && prompt.contains("Hi"),
+            "{prompt}"
+        );
+    }
+
     /// A valid request the parity renderer declines is `NeedsRenderFallback`, for the
     /// host to render another way rather than reject.
     #[test]
