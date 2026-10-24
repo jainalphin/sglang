@@ -160,25 +160,35 @@ mod tests {
     use super::{ChatFormatter, load_chat_formatter};
 
     /// A DeepSeek-V4.1 developer turn, which SGLang's encoder declines,
-    /// renders through Dynamo's encoder instead.
+    /// renders through Dynamo's encoder as SGLang's renders a system turn: in
+    /// SGLang's thinking mode and effort budget, not Dynamo's defaults.
     #[test]
     fn declined_deepseek_v41_requests_render_through_dynamo() {
-        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "messages": [
-                {"role": "developer", "content": "Be brief."},
-                {"role": "user", "content": "Hi"}
-            ]
-        }))
-        .unwrap();
-        let prompt = ChatFormatter::DeepSeekV41
-            .render_prompt(&request)
-            .unwrap()
-            .into_text();
-        assert!(
-            prompt.contains("Be brief.") && prompt.contains("Hi"),
-            "{prompt}"
-        );
+        for effort in [None, Some("none"), Some("low"), Some("high"), Some("max")] {
+            let body = |role: &str| {
+                let mut body = serde_json::json!({
+                    "model": "m",
+                    "messages": [
+                        {"role": role, "content": "Be brief."},
+                        {"role": "user", "content": "Hi"}
+                    ]
+                });
+                if let Some(effort) = effort {
+                    body["reasoning_effort"] = effort.into();
+                }
+                body
+            };
+            let request: CreateChatCompletionRequest =
+                serde_json::from_value(body("developer")).unwrap();
+            let fallback = ChatFormatter::DeepSeekV41
+                .render_prompt(&request)
+                .unwrap()
+                .into_text();
+            let (system, _) = ChatFormatter::DeepSeekV41
+                .render_request(body("system"), &std::collections::HashMap::new())
+                .unwrap();
+            assert_eq!(fallback, system.into_text(), "effort {effort:?}");
+        }
     }
 
     /// A valid request the parity renderer declines is `NeedsRenderFallback`, for the

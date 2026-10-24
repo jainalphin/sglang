@@ -25,9 +25,9 @@ use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
 use self::models::{
-    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
-    render_deepseek_v4, render_deepseek_v41, render_glm53, render_kimi_k3, render_qwen38,
-    takes_content_parts,
+    deep_sort, deepseek_v4_thinking, deepseek_v41_budget, encode_tools_to_typescript, is_glm53,
+    is_qwen38, render_deepseek_v4, render_deepseek_v41, render_glm53, render_kimi_k3,
+    render_qwen38, takes_content_parts,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -128,13 +128,20 @@ impl ChatFormatter {
                     "continue_final_message": !request.should_add_generation_prompt(),
                 });
                 body["messages"] = messages;
+                // Dynamo's V4.1 encoder defaults to thinking; SGLang's to chat.
+                let thinking = deepseek_v4_thinking(&body, &HashMap::new());
+                let budget = deepseek_v41_budget(&body, &HashMap::new());
                 let (prompt, prefix) = match self.render_request(body, &HashMap::new()) {
-                    // Dynamo's encoder renders, its own way, what SGLang's declines.
+                    // Dynamo's encoder renders, its own way, what SGLang's declines,
+                    // with the thinking mode and effort budget SGLang's would use.
                     Err(TemplateError::NeedsRenderFallback { .. })
                         if matches!(self, ChatFormatter::DeepSeekV41) =>
                     {
+                        let mut args = request.chat_template_args().cloned().unwrap_or_default();
+                        args.insert("thinking".into(), thinking.into());
+                        args.insert("reasoning_effort".into(), budget.into());
                         return DeepSeekV41Formatter
-                            .render_prompt(request)
+                            .render_prompt(&TemplateArgsRequest { request, args })
                             .map_err(|error| TemplateError::Renderer {
                                 message: error.to_string(),
                             });

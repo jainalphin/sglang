@@ -113,7 +113,7 @@ fn tool_payload(tool: &Value) -> Result<Value, String> {
 /// `serving_chat._resolve_dsv41_reasoning_effort` as the encoder's 1-100 budget:
 /// kwargs effort replaces the request's verbatim, then the server's default
 /// kwargs, then `SGLANG_DSV41_REASONING_EFFORT`, else `high`.
-fn budget(request: &Value, defaults: &HashMap<String, Value>) -> u8 {
+pub(crate) fn budget(request: &Value, defaults: &HashMap<String, Value>) -> u8 {
     let kwargs = request["chat_template_kwargs"]
         .get("reasoning_effort")
         .filter(|effort| !effort.is_null());
