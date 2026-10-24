@@ -54,9 +54,6 @@ def adler32_strided_checksum(
         strides: list of ints, bytes per item for each tensor
         indices: list of 1D index tensors (one per tensor, on GPU)
     """
-    module = _jit_adler32_module()
-    device = indices[0].device
-
     all_ptrs = []
     all_lens = []
     total_items = 0
@@ -67,15 +64,17 @@ def adler32_strided_checksum(
         offsets = idx.to(torch.int64) * stride + base
         all_ptrs.append(offsets)
         all_lens.append(
-            torch.full((idx.numel(),), stride, dtype=torch.int32, device=device)
+            torch.full((idx.numel(),), stride, dtype=torch.int32, device=idx.device)
         )
         total_items += idx.numel()
 
     if total_items == 0:
         return 1
 
+    module = _jit_adler32_module()
     ptrs = torch.cat(all_ptrs)
     lens = torch.cat(all_lens)
+    device = ptrs.device
 
     num_blocks = (total_items + _BLOCK_SIZE - 1) // _BLOCK_SIZE
     states = _alloc_states(num_blocks, device)

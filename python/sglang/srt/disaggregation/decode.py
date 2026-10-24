@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -31,17 +32,13 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVTransferDestination, StateType
-from sglang.srt.disaggregation.checksum import (
-    KvChecksumComputer,
-    is_health_check_req,
-    page_indices_for_request,
-    state_indices_for_request,
-)
+from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
@@ -461,17 +458,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
 
-        if get_disagg().disaggregation_enable_kv_checksum:
-            kv_args = self.kv_manager.kv_args
-            self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{get_device().gpu_id}"),
-                kv_data_ptrs=kv_args.kv_data_ptrs,
-                kv_item_lens=kv_args.kv_item_lens,
-                state_data_ptrs=kv_args.state_data_ptrs,
-                state_item_lens=kv_args.state_item_lens,
-            )
-        else:
-            self.scheduler.kv_checksum_computer = None
+        self.scheduler.kv_checksum_computer = (
+            KvChecksumComputer.from_kv_args(self.kv_manager.kv_args)
+            if get_disagg().disaggregation_enable_kv_checksum
+            else None
+        )
 
     def _uses_swa_tail_prealloc(self) -> bool:
         return (
@@ -2327,6 +2318,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"req={req.rid}"
         )
 
+        # Where the transferred KV starts; the KV checksum digests from here.
+        req.disagg_decode_prefix_len = total_prefix_len
         self.req_to_token_pool.write(
             (
                 req.kv.req_pool_idx,
@@ -2511,6 +2504,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        # Prefill layouts whose digests cannot be compared, logged once each.
+        self._skipped_checksum_signatures: set = set()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
         self.enable_deferred_kv_release = (
@@ -2534,13 +2529,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
+    def _kv_checksum_comparable(self, signature: int) -> bool:
+        """Digests compare only when the prefill digested this decode's layout.
+        One with another TP width, a PP stage, or the flag off is admitted
+        unverified and logged once, not aborted on every request."""
+        mine = self.scheduler.kv_checksum_computer.signature
+        if signature == mine:
+            return True
+        if signature and signature not in self._skipped_checksum_signatures:
+            self._skipped_checksum_signatures.add(signature)
+            logger.warning(
+                "KV checksum skipped: prefill layout signature %#x differs from "
+                "this decode's %#x (TP width, PP stage, or page size); its "
+                "requests are admitted unverified.",
+                signature,
+                mine,
+            )
+        return False
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
-        # Preserve the checksum before the metadata slot is freed so it can be
-        # re-verified when the request enters a batch, including after retraction.
+        # Keep the checksum before the metadata slot is freed; it is verified
+        # when the request enters a batch.
         idx = decode_req.metadata_buffer_index
         if self.scheduler.kv_checksum_computer is not None:
-            decode_req.req.expected_kv_checksum = self.metadata_buffers.get_kv_checksum(
-                idx
+            digest, signature = self.metadata_buffers.get_kv_checksum(idx)
+            decode_req.req.expected_kv_checksum = (
+                digest if self._kv_checksum_comparable(signature) else 0
             )
         (
             output_id,
@@ -2916,7 +2930,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             assert idx != -1
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
-            self.metadata_buffers.bootstrap_room[idx] = 0
+            self.metadata_buffers.clear_slot(idx)
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
         self.queue = [
@@ -2953,7 +2967,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self._release_request(decode_req)
-        self.metadata_buffers.bootstrap_room[idx] = 0
+        self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
             decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
@@ -3224,41 +3238,57 @@ class SchedulerDisaggregationDecodeMixin:
             return
 
         kv_manager = self.disagg_decode_prealloc_queue.kv_manager
-        verified: List[int] = []
+        mismatch_prob = envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get()
+        mismatched = [0] * len(batch.reqs)
+        messages: Dict[int, str] = {}
         for i, req in enumerate(batch.reqs):
-            if is_health_check_req(req):
-                verified.append(i)
-                continue
-            if not kv_manager.should_verify_kv_checksum(_bootstrap_addr(req)):
-                verified.append(i)
-                continue
             expected = req.expected_kv_checksum
-            if expected == 0:
-                verified.append(i)
+            if expected == 0 or not kv_manager.should_verify_kv_checksum(
+                _bootstrap_addr(req)
+            ):
                 continue
-            seq_len = len(req.origin_input_ids)
-            page_indices_gpu = page_indices_for_request(self, req, seq_len)
-            state_indices = state_indices_for_request(self, req, seq_len)
-            actual = computer.compute(page_indices_gpu, state_indices)
-            if actual == expected:
-                verified.append(i)
-                continue
-            msg = (
-                f"KV checksum mismatch req={req.rid} "
-                f"bootstrap_room={req.bootstrap_room} "
-                f"expected={expected:#x} got={actual:#x}"
-            )
-            logger.error(msg)
-            self._handle_kv_checksum_mismatch(req, msg)
-        if len(verified) != len(batch.reqs):
-            batch.filter_batch(keep_indices=verified)
+            # Verified once. A retraction restores the row after decode has
+            # written its own tokens into the last page, so the handoff digest
+            # no longer describes it.
+            req.expected_kv_checksum = 0
+            actual = computer.digest(self, req, len(req.origin_input_ids))
+            if mismatch_prob > 0 and random.random() < mismatch_prob:
+                actual ^= 1
+            if actual != expected:
+                mismatched[i] = 1
+                messages[i] = (
+                    f"KV checksum mismatch req={req.rid} "
+                    f"bootstrap_room={req.bootstrap_room} "
+                    f"expected={expected:#x} got={actual:#x}"
+                )
+
+        # Corruption is per rank. Agree on the drop set first, or the TP ranks
+        # run different batches and hang on the next collective.
+        mismatched = all_reduce_flags(
+            mismatched, self.attn_tp_cpu_group, dist.ReduceOp.MAX
+        )
+        if not any(mismatched):
+            return
+        for i, req in enumerate(batch.reqs):
+            if mismatched[i]:
+                msg = messages.get(
+                    i,
+                    f"KV checksum mismatch on a peer rank req={req.rid} "
+                    f"bootstrap_room={req.bootstrap_room}",
+                )
+                logger.error(msg)
+                self._handle_kv_checksum_mismatch(req, msg)
+        batch.filter_batch(
+            keep_indices=[i for i, bad in enumerate(mismatched) if not bad]
+        )
 
     def _handle_kv_checksum_mismatch(self, req: Req, msg: str) -> None:
         # A mismatch means the KV this worker received is not what prefill sent,
         # so the cause is hardware or transport rather than the request. Serving
         # keeps going and drops just this request; CI fails instead, because a
-        # single aborted request is easy to miss in a passing run.
-        if is_in_ci():
+        # single aborted request is easy to miss in a passing run -- unless the
+        # mismatch was injected to exercise this very path.
+        if is_in_ci() and envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get() == 0:
             raise RuntimeError(msg)
         prepare_abort(
             req,

@@ -611,6 +611,23 @@ class CommonKVManager(BaseKVManager):
             return KVPoll.Bootstrapping
         return min(statuses)
 
+    def check_peer_aux_buffer_count(self, peer: str, num_remote: int) -> None:
+        """Aux (metadata) buffers pair up positionally, so a peer that
+        registered a different number of them -- an optional buffer such as the
+        KV checksum enabled on one engine only -- gets only the shared prefix.
+        Say so once per registration; the sender stops at the shorter list."""
+        num_local = len(self.kv_args.aux_data_ptrs)
+        if num_remote != num_local:
+            logger.error(
+                "Decode %s registered %d metadata buffers but this prefill has %d; "
+                "only the first %d are transferred. Check that "
+                "--disaggregation-enable-kv-checksum is set on both engines.",
+                peer,
+                num_remote,
+                num_local,
+                min(num_remote, num_local),
+            )
+
     def build_receiver_registration_message(self) -> List[bytes]:
         raise NotImplementedError
 

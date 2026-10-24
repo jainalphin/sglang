@@ -477,11 +477,24 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
-    def set_kv_checksum(self, req: Req, value: int) -> None:
-        self.kv_checksum[req.metadata_buffer_index, 0] = value
+    def set_kv_checksum(self, req: Req, digest: int, signature: int) -> None:
+        # Slot 0 the digest, slot 1 the layout signature it was taken under;
+        # the row is 8 wide for the 64 B RDMA minimum anyway.
+        row = self.kv_checksum[req.metadata_buffer_index]
+        row[0] = digest
+        row[1] = signature
 
-    def get_kv_checksum(self, idx: int) -> int:
-        return int(self.kv_checksum[idx, 0].item())
+    def get_kv_checksum(self, idx: int) -> Tuple[int, int]:
+        """Return ``(digest, signature)``; ``(0, 0)`` means no digest was written."""
+        digest, signature = self.kv_checksum[idx, :2].tolist()
+        return int(digest), int(signature)
+
+    def clear_slot(self, idx: int) -> None:
+        """Reset the fields the next owner reads before its prefill writes
+        them, so it sees "not yet written" instead of the previous owner's."""
+        self.bootstrap_room[idx] = 0
+        if self.kv_checksum is not None:
+            self.kv_checksum[idx] = 0
 
     def get_buf_infos(self):
         bufs = [
