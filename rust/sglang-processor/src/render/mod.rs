@@ -132,8 +132,7 @@ impl ChatFormatter {
                 let thinking = deepseek_v4_thinking(&body, &HashMap::new());
                 let budget = deepseek_v41_budget(&body, &HashMap::new());
                 let (prompt, prefix) = match self.render_request(body, &HashMap::new()) {
-                    // Dynamo's encoder renders, its own way, what SGLang's declines,
-                    // with the thinking mode and effort budget SGLang's would use.
+                    // Dynamo's encoder renders what SGLang's declines, in SGLang's mode.
                     Err(TemplateError::NeedsRenderFallback { .. })
                         if matches!(self, ChatFormatter::DeepSeekV41) =>
                     {

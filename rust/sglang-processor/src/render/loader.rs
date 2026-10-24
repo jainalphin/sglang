@@ -159,9 +159,8 @@ mod tests {
     use super::super::{ChatFormatterOptions, select_chat_formatter};
     use super::{ChatFormatter, load_chat_formatter};
 
-    /// A DeepSeek-V4.1 developer turn, which SGLang's encoder declines,
-    /// renders through Dynamo's encoder as SGLang's renders a system turn: in
-    /// SGLang's thinking mode and effort budget, not Dynamo's defaults.
+    /// A DeepSeek-V4.1 developer turn, which SGLang's encoder declines, renders
+    /// through Dynamo's in SGLang's thinking mode and effort budget.
     #[test]
     fn declined_deepseek_v41_requests_render_through_dynamo() {
         for effort in [None, Some("none"), Some("low"), Some("high"), Some("max")] {
