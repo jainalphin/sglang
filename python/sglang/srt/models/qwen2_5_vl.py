@@ -546,10 +546,13 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        # one segment per frame (t), as in HF: full attention stays within a frame
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                torch.repeat_interleave(
+                    grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+                )
                 .cumsum(dim=0)
                 .to(device=x.device, dtype=torch.int32),
             ]
@@ -642,10 +645,13 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         )
 
         # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        # one segment per frame (t), as in HF: full attention stays within a frame
         cu_seqlens = torch.cat(
             [
                 torch.tensor([0], device=x.device, dtype=torch.int32),
-                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                torch.repeat_interleave(
+                    grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+                )
                 .cumsum(dim=0)
                 .to(device=x.device, dtype=torch.int32),
             ]
@@ -654,8 +660,9 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         full_layout = [0, 0]
         total_tokens = 0
         for temporal, height, width in grid_thw.tolist():
-            total_tokens += temporal * height * width
-            full_layout.append(total_tokens)
+            for _ in range(temporal):
+                total_tokens += height * width
+                full_layout.append(total_tokens)
 
         return self.cuda_graph_runner.run(
             x=x,
